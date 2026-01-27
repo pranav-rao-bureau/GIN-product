@@ -1,11 +1,12 @@
 import hashlib
 import os
+import secrets
 from typing import Dict, List
 
+from pyathena import connect
 import yaml
 
 from neo4j import GraphDatabase
-from pyathena import connect
 
 
 def load_secrets(secrets_file: str = "secrets.yml") -> dict:
@@ -14,10 +15,10 @@ def load_secrets(secrets_file: str = "secrets.yml") -> dict:
         raise FileNotFoundError(f"Secrets file not found: {secrets_file}")
     with open(secrets_file, "r") as f:
         secrets = yaml.safe_load(f)
-    return secrets or {}
+    return secrets
 
 
-def neo4j_connect(config=None, secrets_file: str = "secrets.yml"):
+def neo4j_connect(secrets_file: str = "secrets.yml"):
     """
     Returns a valid neo4j connection object using credentials from secrets file.
 
@@ -25,61 +26,51 @@ def neo4j_connect(config=None, secrets_file: str = "secrets.yml"):
     """
 
     secrets = load_secrets(secrets_file)
-    cfg = {**secrets.get("neo4j", {}), **(config or {})}
+    neo4j_cfg = secrets.get("neo4j")
 
-    uri = cfg.get("uri") or cfg.get("bolt_url") or cfg.get("host")
-    user = cfg.get("user") or cfg.get("username")
-    password = cfg.get("password")
-    encrypted = cfg.get("encrypted", False)
-
-    # Fallback for host/port if uri is not provided
-    if not uri and "host" in cfg and "port" in cfg:
-        uri = f"bolt://{cfg['host']}:{cfg['port']}"
-
-    driver = GraphDatabase.driver(
-        uri,
-        auth=(user, password),
-        encrypted=encrypted,
-    )
+    driver = GraphDatabase.driver(**neo4j_cfg)
     return driver
 
 
-def athena_connect(config=None, secrets_file: str = "secrets.yml"):
+def athena_connect(secrets_file: str = "secrets.yml"):
     """
-    Returns a valid AWS Athena connection object using credentials from secrets file.
-
-    Config should include override keys: aws_access_key_id, aws_secret_access_key, region_name, s3_staging_dir, database.
+    Uses boto3 and a config/secrets_file to create an Athena client object.
     """
 
     secrets = load_secrets(secrets_file)
-    cfg = {**secrets.get("athena", {}), **(config or {})}
+    athena_cfg = secrets.get("athena")
 
-    aws_access_key_id = cfg.get("aws_access_key_id")
-    aws_secret_access_key = cfg.get("aws_secret_access_key")
-    region_name = cfg.get("region_name", "us-east-1")
-    s3_staging_dir = cfg.get("s3_staging_dir")
-    database = cfg.get("database")
-
-    conn = connect(
-        aws_access_key_id=aws_access_key_id,
-        aws_secret_access_key=aws_secret_access_key,
-        region_name=region_name,
-        s3_staging_dir=s3_staging_dir,
-        schema_name=database,
-    )
-    return conn
+    athena_client = connect(**athena_cfg)
+    return athena_client
 
 
 def retrive_identities(
     merchant_id: str,
+    end_date: str,
     start_date: str = None,
-    end_date: str = None,
     data_retention_days: int = None,
 ):
     """
     Query all identities for a merchant_id for a given time frame from the API call logs.
     """
-    pass
+
+    if start_date is None and data_retention_days is None:
+        raise Exception("Please provide either start date or data retention days")
+
+    if start_date is None:
+        start_date = end_date - data_retention_days
+
+    query = f"""
+    SELECT merchantid,
+        event, 
+        merchantrequestbody,
+        response,
+        requesttimestamp,
+    FROM base.service_api_logevent_pqt
+    where merchantid = {merchant_id}
+    and requesttimestamp between {start_date} and {end_date}
+    and merchantstatuscode = 200
+    """
 
 
 def subgraph_query(id_type: str, ids: list, max_depth=4, batch_size=1000) -> list:
