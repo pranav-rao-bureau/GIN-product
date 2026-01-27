@@ -1,12 +1,21 @@
+from collections import defaultdict
 import hashlib
 import os
-import secrets
 from typing import Dict, List
 
+import json
+import pandas as pd
 from pyathena import connect
 import yaml
 
 from neo4j import GraphDatabase
+
+PAN_KEY = "panNumber"
+NAME_KEY = "fullName"
+DL_KEY = "dlNumber"
+RC_KEY = "rcNumber"
+PHONE_KEY = "phoneNumber"
+EMAIL_KEY = "emailAddress"
 
 
 def load_secrets(secrets_file: str = "secrets.yml") -> dict:
@@ -44,9 +53,10 @@ def athena_connect(secrets_file: str = "secrets.yml"):
     return athena_client
 
 
-def retrive_identities(
+def retrieve_api_logs(
     merchant_id: str,
     end_date: str,
+    athena_client,
     start_date: str = None,
     data_retention_days: int = None,
 ):
@@ -71,6 +81,8 @@ def retrive_identities(
     and requesttimestamp between {start_date} and {end_date}
     and merchantstatuscode = 200
     """
+
+    return athena_client.query(query).to_pandas()
 
 
 def subgraph_query(id_type: str, ids: list, max_depth=4, batch_size=1000) -> list:
@@ -146,10 +158,12 @@ def retrive_subgraphs(
     Returns:
         List of subgraph dicts (one per seed id)
     """
-    all_subgraphs = []
+    all_subgraphs = defaultdict(list)
     for id_type, ids in seed_identities.items():
-        subgraphs = subgraph_query(id_type, ids, max_depth=max_depth)
-        all_subgraphs.extend(subgraphs)
+        subgraphs = subgraph_query(
+            id_type, ids, max_depth=max_depth, batch_size=batch_size
+        )
+        all_subgraphs[id_type].extend(subgraphs)
     return all_subgraphs
 
 
@@ -185,8 +199,8 @@ def is_seed_node(node, this_seed_type, this_seed_value, seed_identity_sets):
 
 
 def write_subgraphs(
-    subgraphs: list,
-    merchant_neo4j_config: dict = None,
+    subgraphs: Dict[str, List],
+    secrets_file: dict = None,
     seed_identities: Dict[str, List[str]] = None,
 ) -> None:
     """
@@ -199,7 +213,6 @@ def write_subgraphs(
         seed_identities: (optional) Dictionary with keys as id_type and values as seed value lists for recognition.
             If not provided, all unmasked nodes except the root will be masked.
     """
-    from collections import defaultdict
 
     # Build set of seed values per id_type for fast lookup
     seed_identity_sets = defaultdict(set)
@@ -208,9 +221,7 @@ def write_subgraphs(
             seed_identity_sets[typ].update(values)
 
     # Connect to merchant-specific Neo4j (target write instance)
-    merchant_driver = neo4j_connect(
-        config=merchant_neo4j_config, secrets_file="secrets.yml"
-    )
+    merchant_driver = neo4j_connect(secrets_file=secrets_file)
 
     with merchant_driver.session() as session:
         for subgraph in subgraphs:
@@ -319,3 +330,49 @@ def hash_identity(node: Dict[str, str]) -> Dict[str, str]:
             hashed_node["last_seen"] = props["last_seen"]
 
     return hashed_node
+
+
+def extract_ids_from_logs(logs: pd.DataFrame, event_type: str):
+    """
+    Extract the IDs from the API logs for a given event type.
+    Args:
+        logs: pd.DataFrame containing the API logs.
+        event_type: str containing the event type.
+        processing_function: callable function to process the logs.
+    Returns:
+        dataframe containing the IDs.
+    """
+    processing_function = {
+        "pan-profile": pan_profile_processing,
+    }[event_type]
+    return processing_function(logs)
+
+
+def pan_profile_processing(logs: pd.DataFrame) -> Dict[str, List[str]]:
+    """
+    Process the PAN profile logs.
+    """
+    result = {}
+    result[PAN_KEY] = logs.merchantrequestbody.apply(
+        lambda x: json.loads(x).get("pan")
+    ).to_list()
+    result[NAME_KEY] = logs.response.apply(
+        lambda x: json.loads(x).get("name")
+    ).to_list()
+    return result
+
+
+def dl_processing(logs: pd.DataFrame) -> Dict[str, List[str]]:
+    pass
+
+
+def phone_processing(logs: pd.DataFrame) -> Dict[str, List[str]]:
+    pass
+
+
+def email_processing(logs: pd.DataFrame) -> Dict[str, List[str]]:
+    pass
+
+
+def rc_processing(logs: pd.DataFrame) -> Dict[str, List[str]]:
+    pass
