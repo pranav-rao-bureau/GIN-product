@@ -10,12 +10,16 @@ import yaml
 
 from neo4j import GraphDatabase
 
-PAN_KEY = "panNumber"
-NAME_KEY = "fullName"
-DL_KEY = "dlNumber"
-RC_KEY = "rcNumber"
-PHONE_KEY = "phoneNumber"
-EMAIL_KEY = "emailAddress"
+
+class IdentityTypes:
+    PAN = "pan"
+    NAME = "fullName"
+    DL = "dlNumber"
+    RC = "vehicleRC"
+    PHONE = "mobile"
+    EMAIL = "email"
+    VOTER = "voterId"
+    ADDRESS = "completeAddress"
 
 
 def load_secrets(secrets_file: str = "secrets.yml") -> dict:
@@ -23,40 +27,34 @@ def load_secrets(secrets_file: str = "secrets.yml") -> dict:
     if not os.path.exists(secrets_file):
         raise FileNotFoundError(f"Secrets file not found: {secrets_file}")
     with open(secrets_file, "r") as f:
-        secrets = yaml.safe_load(f)
+        secrets = yaml.load(f, Loader=yaml.FullLoader)
     return secrets
 
 
-def neo4j_connect(secrets_file: str = "secrets.yml"):
+def neo4j_connect(secrets, read_or_write: str = "read"):
     """
     Returns a valid neo4j connection object using credentials from secrets file.
 
     If config is provided, it overrides values in secrets file.
     """
-
-    secrets = load_secrets(secrets_file)
-    neo4j_cfg = secrets.get("neo4j")
-
+    neo4j_cfg = secrets["{read_or_write}_neo4j"]
     driver = GraphDatabase.driver(**neo4j_cfg)
     return driver
 
 
-def athena_connect(secrets_file: str = "secrets.yml"):
+def athena_connect(secrets):
     """
     Uses boto3 and a config/secrets_file to create an Athena client object.
     """
-
-    secrets = load_secrets(secrets_file)
-    athena_cfg = secrets.get("athena")
-
+    athena_cfg = secrets["athena"]
     athena_client = connect(**athena_cfg)
     return athena_client
 
 
 def retrieve_api_logs(
+    athena_client,
     merchant_id: str,
     end_date: str,
-    athena_client,
     start_date: str = None,
     data_retention_days: int = None,
 ):
@@ -83,88 +81,6 @@ def retrieve_api_logs(
     """
 
     return athena_client.query(query).to_pandas()
-
-
-def subgraph_query(id_type: str, ids: list, max_depth=4, batch_size=1000) -> list:
-    """
-    Query subgraphs for each seed identity up to a specified maximum depth, from global GIN.
-
-    Processes ids in batches, improving query efficiency for large lists.
-
-    Args:
-        id_type (str): The type of identity node (e.g., "email", "phone").
-        ids (List[str]): List of seed identity values.
-        max_depth (int): Maximum BFS traversal depth.
-        batch_size (int): Number of seeds per Cypher batch.
-
-    Returns:
-        List[Dict]: List of subgraphs (each subgraph as list of nodes/edges for each id).
-    """
-
-    driver = neo4j_connect()
-    results = []
-
-    cypher_template = f"""
-    UNWIND $seed_values AS seed_value
-    MATCH (seed:{id_type} {{value: seed_value}})
-    CALL apoc.path.subgraphAll(seed, {{
-        maxLevel: $max_depth
-    }}) YIELD nodes, relationships
-    RETURN
-        seed.value AS seed_value,
-        [n IN nodes | {{
-            id: id(n),
-            labels: labels(n),
-            properties: properties(n)
-        }}] AS nodes,
-        [r IN relationships | {{
-            id: id(r),
-            type: type(r),
-            start: startNode(r).id,
-            end: endNode(r).id,
-            properties: properties(r)
-        }}] AS relationships
-    """
-
-    with driver.session() as session:
-        for i in range(0, len(ids), batch_size):
-            batch = ids[i : i + batch_size]
-            records = session.run(
-                cypher_template, seed_values=batch, max_depth=max_depth
-            )
-            for record in records:
-                results.append(
-                    {
-                        "seed_type": id_type,
-                        "seed_value": record["seed_value"],
-                        "nodes": record["nodes"],
-                        "relationships": record["relationships"],
-                    }
-                )
-
-    return results
-
-
-def retrive_subgraphs(
-    seed_identities: Dict[str, List[str]], max_depth=4, batch_size=1000
-) -> List[Dict[str, str]]:
-    """
-    Fetch all subgraphs for each identity type present in the input seed_identities.
-
-    Args:
-        seed_identities: Dictionary with keys as id_type and values as list of seed ids, e.g. {'email': [...], 'phone': [...]}
-        max_depth: Maximum BFS traversal depth for each seed
-
-    Returns:
-        List of subgraph dicts (one per seed id)
-    """
-    all_subgraphs = defaultdict(list)
-    for id_type, ids in seed_identities.items():
-        subgraphs = subgraph_query(
-            id_type, ids, max_depth=max_depth, batch_size=batch_size
-        )
-        all_subgraphs[id_type].extend(subgraphs)
-    return all_subgraphs
 
 
 def is_seed_node(node, this_seed_type, this_seed_value, seed_identity_sets):
@@ -353,10 +269,10 @@ def pan_profile_processing(logs: pd.DataFrame) -> Dict[str, List[str]]:
     Process the PAN profile logs.
     """
     result = {}
-    result[PAN_KEY] = logs.merchantrequestbody.apply(
+    result[IdentityTypes.PAN] = logs.merchantrequestbody.apply(
         lambda x: json.loads(x).get("pan")
     ).to_list()
-    result[NAME_KEY] = logs.response.apply(
+    result[IdentityTypes.NAME] = logs.response.apply(
         lambda x: json.loads(x).get("name")
     ).to_list()
     return result
