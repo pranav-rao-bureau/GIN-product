@@ -2,13 +2,15 @@ from collections import defaultdict
 import hashlib
 from neo4j import GraphDatabase
 import json
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Set
+import pandas as pd
 
 
 class SubgraphExtractor:
-    def __init__(self, secrets: dict):
+    def __init__(self, secrets: dict, batch_size: int = 100):
         """Initialize connection to Neo4j database"""
         self.driver = GraphDatabase.driver(**secrets["read_neo4j"])
+        self.batch_size = batch_size
 
     def close(self):
         """Close the database connection"""
@@ -16,9 +18,8 @@ class SubgraphExtractor:
 
     def extract_subgraph_with_terminators(
         self,
-        seeds: Dict[str, List[str]],
+        seeds: Dict[str, pd.DataFrame],
         terminator_labels: List[str] = None,
-        batch_size: int = 100,
     ) -> Dict[str, List[Dict]]:
         if terminator_labels is None:
             terminator_labels = ["fullName", "publicIP", "completeAddress"]
@@ -26,17 +27,30 @@ class SubgraphExtractor:
         all_nodes = {}  # Deduplicate by Neo4j ID
         all_relationships = {}
 
-        for node_type, node_values in seeds.items():
-            for i in range(0, len(node_values), batch_size):
-                batch_seed_values = node_values[i : i + batch_size]
-                print(
-                    f"Processing batch {i // batch_size + 1}: seeds {i} to {min(i + batch_size -1, len(node_values)-1)} ({node_type})"
-                )
-                batch_nodes, batch_rels = self._process_batch(
-                    node_type, batch_seed_values, terminator_labels
-                )
-                all_nodes.update(batch_nodes)
-                all_relationships.update(batch_rels)
+        for event_type, event_data in seeds.items():
+            node_types = event_data.drop(columns=["requestTimestamp"]).columns.tolist()
+            for node_type in node_types:
+                # Batch node_values by batch_size for processing
+                node_values = event_data[node_type].values
+                total = len(node_values)
+                for i in range(0, total, self.batch_size):
+                    node_values_batch = node_values[i : i + self.batch_size]
+                    batch_nodes, batch_rels = self._process_batch(
+                        node_type, node_values_batch, terminator_labels
+                    )
+                    # Add request timestamp to the nodes
+                    for node in batch_nodes.values():
+                        # Find matching timestamp from the original batch DataFrame
+                        request_timestamp = event_data[
+                            (event_data[node_type] == node["properties"]["value"])
+                        ]["requestTimestamp"]
+                        if not request_timestamp.empty:
+                            node["properties"]["requestTimestamp"] = (
+                                request_timestamp.values[0]
+                            )
+
+                    all_nodes.update(batch_nodes)
+                    all_relationships.update(batch_rels)
 
         return {
             "nodes": list(all_nodes.values()),
@@ -203,17 +217,24 @@ class SubgraphExtractor:
         return f"{{{props_str}}}"
 
 
-class GraphWriter:
+class SubgraphWriter:
     def __init__(self, secrets: dict):
         """Initialize connection to Neo4j database"""
-        self.driver = GraphDatabase.driver(**secrets["write_neo4j"])
+        try:
+            self.driver = GraphDatabase.driver(**secrets["write_neo4j"])
+        except Exception as e:
+            print(f"Error initializing Neo4j connection: {e}")
+            print(f"Will not be able to write to Neo4j, will export as json instead")
+            self.export_as_json = True
+        else:
+            self.export_as_json = False
 
     def close(self):
         """Close the database connection"""
         self.driver.close()
 
     @staticmethod
-    def hash_identity(node: dict) -> dict:
+    def hash_identity(node: dict, is_seed_node: bool) -> dict:
         """
         Given a node dictionary, mask its 'value' field in properties, preserving labels and id.
         """
@@ -227,44 +248,32 @@ class GraphWriter:
             original_val = node_copy["properties"]["value"]
             # Use SHA256 for hashing
             hashed_val = hashlib.sha256(str(original_val).encode("utf-8")).hexdigest()
-            node_copy["properties"]["value"] = hashed_val
+            node_copy["properties"]["hashed_value"] = hashed_val
+
+        if not is_seed_node:
+            del node_copy["properties"]["value"]
 
         return node_copy
 
     @staticmethod
-    def is_seed_node(
-        node: dict, this_seed_type: str, this_seed_value: str, seed_identities=None
-    ) -> bool:
+    def is_seed_node(node: dict, seed_identities: Dict[str, Set[str]]) -> bool:
         """
         Determine if a given node is a seed node, based on type/value, and optionally, a set of allowed seed values for each id_type.
         """
-        if seed_identities:
-            for typ, seedvals in seed_identities.items():
-                if (
-                    "labels" in node
-                    and typ in node["labels"]
-                    and "properties" in node
-                    and "value" in node["properties"]
-                ):
-                    value = node["properties"]["value"]
-                    if value and value in seedvals:
-                        return True
-        else:
-            # If no seed_identities: treat the root node for this subgraph as the seed
+        for typ, seedvals in seed_identities.items():
             if (
                 "labels" in node
-                and this_seed_type in node["labels"]
+                and typ in node["labels"]
                 and "properties" in node
                 and "value" in node["properties"]
-                and node["properties"]["value"] == this_seed_value
             ):
-                return True
+                return node["properties"]["value"] in seedvals
         return False
 
     def write_subgraphs(
         self,
-        subgraphs: Dict[str, List],
-        seed_identities: Dict[str, List[str]] = None,
+        subgraph: Dict[str, List],
+        seed_identities: Dict[str, List[str]],
     ) -> None:
         """
         Write all the subgraphs extracted from global GIN to merchant specific GIN.
@@ -283,93 +292,70 @@ class GraphWriter:
                 seed_identity_sets[typ].update(values)
 
         with self.driver.session() as session:
-            for subgraph in subgraphs:
-                seed_type = subgraph.get("seed_type")
-                seed_value = subgraph.get("seed_value")
-                nodes = subgraph.get("nodes", [])
-                relationships = subgraph.get("relationships", [])
+            nodes = subgraph["nodes"]
+            relationships = subgraph["relationships"]
 
-                # Build node id mapping for relationships
-                node_id_map = {}
-                processed_nodes = []
-                for node in nodes:
-                    # Only unmask if node is a seed node
-                    if not self.is_seed_node(
-                        node, seed_type, seed_value, seed_identities
-                    ):
-                        masked_node = self.hash_identity(node)
-                    else:
-                        masked_node = node
-                    # Neo4j node id is not preserved on insert, so for write purposes use a temp id
-                    node_key = node["id"]
-                    node_id_map[node_key] = masked_node  # Used to map relationships
+            node_id_map = {}
+            processed_nodes = []
+            for node in nodes:
+                is_seed_node = self.is_seed_node(node, seed_identity_sets)
+                masked_node = self.hash_identity(node, is_seed_node)
+                # Neo4j node id is not preserved on insert, so for write purposes use a temp id
+                node_key = masked_node["id"]
+                node_id_map[node_key] = masked_node
+                processed_nodes.append((node_key, masked_node))
 
-                    processed_nodes.append((node_key, masked_node))
+            # Write nodes (MERGE for idempotency, using all available label/value)
+            for node_key, node in processed_nodes:
+                labels = ":".join(node["labels"]) if "labels" in node else ""
+                properties = node.get("properties", {})
+                # The unique matcher for node: id_type + value if unmasked, otherwise masked value
+                # Remove internal Neo4j id if present
+                properties = properties.copy()
+                if "id" in properties:
+                    del properties["id"]
 
-                # Write nodes (MERGE for idempotency, using all available label/value)
-                for node_key, node in processed_nodes:
-                    labels = ":".join(node["labels"]) if "labels" in node else ""
-                    properties = node.get("properties", {})
-                    # The unique matcher for node: id_type + value if unmasked, otherwise masked value
-                    # Remove internal Neo4j id if present
-                    properties = properties.copy()
-                    if "id" in properties:
-                        del properties["id"]
+                # Compose Cypher MERGE based on available information
+                props_cypher = ", ".join([f"{k}: ${k}" for k in properties])
+                cypher = f"""
+                MERGE (n{f":{labels}" if labels else ""} {{ {props_cypher} }})
+                SET n += $extra_props
+                """
+                session.run(cypher, **properties, extra_props=properties)
 
-                    # Compose Cypher MERGE based on available information
-                    props_cypher = ", ".join([f"{k}: ${k}" for k in properties])
-                    cypher = f"""
-                    MERGE (n{f":{labels}" if labels else ""} {{ {props_cypher} }})
-                    SET n += $extra_props
-                    """
-                    session.run(cypher, **properties, extra_props=properties)
+            # Write relationships
+            for rel in relationships:
+                start_node = node_id_map.get(rel["start_node_id"])
+                end_node = node_id_map.get(rel["end_node_id"])
+                if not start_node or not end_node:
+                    continue
 
-                # Write relationships
-                for rel in relationships:
-                    start_node = node_id_map.get(rel["start_node_id"])
-                    end_node = node_id_map.get(rel["end_node_id"])
-                    if not start_node or not end_node:
-                        continue
-
-                    rel_type = rel["type"]
-                    rel_properties = rel.get("properties", {}).copy()
-                    if "id" in rel_properties:
-                        del rel_properties["id"]
-                    cypher = (
-                        f"""
-                    MATCH (a), (b)
-                    WHERE """
-                        + " AND ".join(
-                            [
-                                f"all(label IN $start_labels WHERE label IN labels(a))",
-                                f"all(label IN $end_labels WHERE label IN labels(b))",
-                                "a.value = $start_value",
-                                "b.value = $end_value",
-                            ]
-                        )
-                        + f"""
-                    MERGE (a)-[r:{rel_type}]->(b)
-                    SET r += $rel_properties
-                    """
+                rel_type = rel["type"]
+                rel_properties = rel.get("properties", {}).copy()
+                if "id" in rel_properties:
+                    del rel_properties["id"]
+                cypher = (
+                    f"""
+                MATCH (a), (b)
+                WHERE """
+                    + " AND ".join(
+                        [
+                            f"all(label IN $start_labels WHERE label IN labels(a))",
+                            f"all(label IN $end_labels WHERE label IN labels(b))",
+                            "a.hashed_value = $start_value",
+                            "b.hashed_value = $end_value",
+                        ]
                     )
-                    session.run(
-                        cypher,
-                        start_labels=start_node["labels"],
-                        end_labels=end_node["labels"],
-                        start_value=start_node["properties"]["value"],
-                        end_value=end_node["properties"]["value"],
-                        rel_properties=rel_properties,
-                    )
-
-    def write_subgraph(self, nodes: List[Dict], relationships: List[Dict]):
-        """Write subgraph to Neo4j database (for backward compatibility, not used directly)"""
-        self.write_subgraphs(
-            [
-                {
-                    "nodes": nodes,
-                    "relationships": relationships,
-                    "seed_type": None,
-                    "seed_value": None,
-                }
-            ]
-        )
+                    + f"""
+                MERGE (a)-[r:{rel_type}]->(b)
+                SET r += $rel_properties
+                """
+                )
+                session.run(
+                    cypher,
+                    start_labels=start_node["labels"],
+                    end_labels=end_node["labels"],
+                    start_value=start_node["properties"].get("hashed_value", ""),
+                    end_value=end_node["properties"].get("hashed_value", ""),
+                    rel_properties=rel_properties,
+                )
