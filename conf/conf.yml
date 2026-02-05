@@ -1,4 +1,4 @@
-athena_confg
-read_neo4j_config
-write_neo4j_config
-merchant_config
+merchant_config:
+  merchantid: "org_x6THKX01ZFybA9Np"
+  merchant_name: "Kotak Mahindra Bank"
+  merchant_data_retention_days: 14
