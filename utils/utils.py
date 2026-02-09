@@ -5,14 +5,22 @@ import pandas as pd
 from pyathena import connect
 import yaml
 
-from utils.logs_processing import EventTypes, pan_profile_processing, IdentityTypes
+from utils.logs_processing import EventTypes, pan_profile_processing
 
 
 PROCESSING_FUNCTIONS = {
-    EventTypes.PAN_PROFILE: pan_profile_processing,
-    EventTypes.PAN_ADVANCED: pan_profile_processing,
+    EventTypes.PAN_PROFILE.value: pan_profile_processing,
+    EventTypes.PAN_ADVANCED.value: pan_profile_processing,
     # add event types are processing functions are implemented here
 }
+
+
+def load_config(config_path: str) -> dict:
+    """Load merchant/config from a YAML file."""
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+    with open(config_path, "r") as f:
+        return yaml.safe_load(f)
 
 
 def load_secrets(secrets_file: str = "secrets.yml") -> dict:
@@ -59,6 +67,8 @@ def retrieve_api_logs(
         requesttimestamp,
     FROM base.service_api_logevent_pqt
     where merchantid = {merchant_id}
+    // make use of partition fields (year month day and hour) to filter the logs 
+    // rather than using requesttimestamp between {start_date} and {end_date}
     and requesttimestamp between {start_date} and {end_date}
     and merchantstatuscode = 200
     and event in ({','.join(event_types)})
@@ -85,7 +95,3 @@ def extract_ids_from_logs(
         result = processing_function(logs[logs["event"] == event_type])
         results[event_type] = result
     return results
-
-
-def merge_requesttime_and_nodes():
-    pass

@@ -1,9 +1,13 @@
 from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 import hashlib
-from neo4j import GraphDatabase
 import json
-from typing import List, Dict, Tuple, Set
+from typing import Dict, List, Set, Tuple
+
+from neo4j import GraphDatabase
 import pandas as pd
+
+from utils.logs_processing import IdentityTypes
 
 
 class SubgraphExtractor:
@@ -273,7 +277,7 @@ class SubgraphWriter:
     def write_subgraphs(
         self,
         subgraph: Dict[str, List],
-        seed_identities: Dict[str, List[str]],
+        seed_identities: Dict[str, pd.DataFrame],
     ) -> None:
         """
         Write all the subgraphs extracted from global GIN to merchant specific GIN.
@@ -355,7 +359,79 @@ class SubgraphWriter:
                     cypher,
                     start_labels=start_node["labels"],
                     end_labels=end_node["labels"],
-                    start_value=start_node["properties"].get("hashed_value", ""),
-                    end_value=end_node["properties"].get("hashed_value", ""),
+                    start_value=start_node["properties"]["hashed_value"],
+                    end_value=end_node["properties"]["hashed_value"],
                     rel_properties=rel_properties,
+                )
+
+
+class SubgraphCleaner:
+    """
+    This class is used to clean the subgraph by removing node values
+    for nodes which have request timestamp older than `merchant_data_retention_days` days.
+    This class will be instantiated as part of a automated cron job to clean the subgraphs.
+    """
+
+    def __init__(self, secrets: dict, merchant_conf: dict):
+        """Initialize connection to Neo4j and retention policy."""
+        self.merchant_data_retention_days = merchant_conf[
+            "merchant_data_retention_days"
+        ]
+        self.driver = GraphDatabase.driver(**secrets["write_neo4j"])
+
+    def close(self):
+        """Close the database connection."""
+        self.driver.close()
+
+    def clean(self) -> int:
+        """
+        Remove the `value` property from nodes whose requestTimestamp is older
+        than merchant_data_retention_days. Nodes and relationships are left intact.
+        Returns the number of nodes updated.
+        """
+        cutoff = datetime.now(timezone.utc) - timedelta(
+            days=self.merchant_data_retention_days
+        )
+        query = """
+            MATCH (n)
+            WHERE n.requestTimestamp IS NOT NULL
+              AND n.requestTimestamp < $cutoff
+              AND n.value IS NOT NULL
+            WITH n
+            REMOVE n.value
+            RETURN count(n) AS updated
+        """
+        with self.driver.session() as session:
+            result = session.run(query, cutoff=cutoff)
+            record = result.single()
+            return record["updated"] if record else 0
+
+
+class GraphInitializer:
+    """
+    This class will be used as a one time setup script to create the graph schema and indexes.
+    """
+
+    def __init__(self, secrets: dict):
+        """Initialize connection to Neo4j database"""
+        self.driver = GraphDatabase.driver(**secrets["write_neo4j"])
+
+    def close(self):
+        """Close the database connection"""
+        self.driver.close()
+
+    def setup(self) -> None:
+        """Create the graph schema and indexes"""
+        identity_types = [identity_type.value for identity_type in IdentityTypes]
+        with self.driver.session() as session:
+            for identity_type in identity_types:
+                session.run(
+                    "CREATE INDEX IF NOT EXISTS FOR (n:{0}) ON (n.hashed_value)".format(
+                        identity_type
+                    )
+                )
+                session.run(
+                    "CREATE INDEX IF NOT EXISTS FOR (n:{0}) ON (n.requestTimestamp)".format(
+                        identity_type
+                    )
                 )

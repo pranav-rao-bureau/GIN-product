@@ -1,8 +1,10 @@
-import pandas as pd
+from enum import Enum
 import json
 
+import pandas as pd
 
-class IdentityTypes:
+
+class IdentityTypes(Enum):
     PAN = "pan"
     NAME = "fullName"
     DL = "dlNumber"
@@ -13,7 +15,7 @@ class IdentityTypes:
     ADDRESS = "completeAddress"
 
 
-class EventTypes:
+class EventTypes(Enum):
     PAN_PROFILE = "pan-profile"
     PAN_ADVANCED = "pan-advanced"
     DL = "dummy_dl"
@@ -30,12 +32,12 @@ def pan_profile_processing(logs: pd.DataFrame) -> pd.DataFrame:
 
     """
     result = pd.DataFrame()
-    result[IdentityTypes.PAN] = logs.merchantrequestbody.apply(
+    result[IdentityTypes.PAN.value] = logs.merchantrequestbody.apply(
         lambda x: json.loads(x).get("pan")
     )
     result["requestTimestamp"] = logs.requesttimestamp
     result.sort_values(by="requestTimestamp", inplace=True)
-    return result.drop_duplicates(subset=[IdentityTypes.PAN], keep="last")
+    return result.drop_duplicates(subset=[IdentityTypes.PAN.value], keep="last")
 
 
 def dl_processing(logs: pd.DataFrame) -> pd.DataFrame:
