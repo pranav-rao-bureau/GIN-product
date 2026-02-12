@@ -37,11 +37,11 @@ def create_parser() -> argparse.ArgumentParser:
         default="./secrets.yml",
         help="Path to the secrets YAML file (e.g. ./secrets.yml)",
     )
+
     parser.add_argument(
         "--config",
-        required=True,
         type=str,
-        default="./conf/conf.yml",
+        default="conf.yml",
         help="Path to the merchant config YAML file (e.g. ./conf/conf.yml)",
     )
     parser.add_argument(

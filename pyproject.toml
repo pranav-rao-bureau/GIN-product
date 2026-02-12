@@ -21,3 +21,8 @@ dependencies = [
 [project.scripts]
 # This creates a command line shortcut
 gin-run = "gin_product.main:main"
+
+
+[tool.setuptools.package-data]
+# This tells setuptools to include any .yml files found in any subfolder
+"*" = ["*.yml", "*.yaml"]

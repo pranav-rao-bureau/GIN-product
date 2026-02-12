@@ -1,6 +1,6 @@
 from datetime import date, timedelta
+from importlib import resources
 import os
-from tracemalloc import start
 from typing import Dict, List
 
 import pandas as pd
@@ -18,11 +18,9 @@ PROCESSING_FUNCTIONS = {
 }
 
 
-def load_config(config_path: str) -> dict:
+def load_config(config_filename: str) -> dict:
     """Load merchant/config from a YAML file."""
-    if not os.path.exists(config_path):
-        raise FileNotFoundError(f"Config file not found: {config_path}")
-    with open(config_path, "r") as f:
+    with resources.files("gin_product.conf").joinpath(config_filename).open("r") as f:
         return yaml.safe_load(f)
 
 

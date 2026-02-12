@@ -4,7 +4,7 @@ This project provides a set of Python modules for interacting with and analyzing
 
 ## Features
 
-- **Genericness Calculation**:  
+- !!TODO **Genericness Calculation**:  
   Methods to compute the genericness of nodes (such as emails or phone numbers), which assist in validating identities and cleaning the graph.
  
 - **Graph Feature Extraction**:  
