@@ -9,9 +9,13 @@ from typing import Dict
 
 import pandas as pd
 
-from utils.graph_utils import GraphInitializer, SubgraphExtractor, SubgraphWriter
-from utils.logs_processing import EventTypes
-from utils.utils import (
+from gin_product.utils.graph_utils import (
+    GraphInitializer,
+    SubgraphExtractor,
+    SubgraphWriter,
+)
+from gin_product.utils.logs_processing import EventTypes
+from gin_product.utils.utils import (
     athena_connect,
     extract_ids_from_logs,
     load_config,
@@ -69,6 +73,13 @@ def create_parser() -> argparse.ArgumentParser:
         type=int,
         help="Batch size for processing node values",
     )
+    parser.add_argument(
+        "--clear-graph",
+        required=False,
+        default=False,
+        type=bool,
+        help="Whether to clear the graph before setup",
+    )
     return parser
 
 
@@ -99,7 +110,7 @@ def main():
     subgraph = extractor.extract_subgraph_with_terminators(seeds=seeds)
     extractor.close()
 
-    initializer = GraphInitializer(secrets)
+    initializer = GraphInitializer(secrets, do_clear_graph=args.clear_graph)
     initializer.setup()
     initializer.close()
 

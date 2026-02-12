@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gin_product"
+version = "0.1.0"
+description = "A package for GIN product graph analysis"
+dependencies = [
+    "pyyaml",
+    "neo4j==5.28.3",
+    "numpy==2.0.2",
+    "pandas==2.3.3",
+    "python-dateutil==2.9.0.post0",
+    "pytz==2025.2",
+    "six==1.17.0",
+    "tzdata==2025.3",
+    "pytest==7.0.0",
+]
+
+[project.scripts]
+# This creates a command line shortcut
+gin-run = "gin_product.main:main"

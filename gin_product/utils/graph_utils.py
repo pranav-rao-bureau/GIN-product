@@ -7,14 +7,15 @@ from typing import Dict, List, Set, Tuple
 from neo4j import GraphDatabase
 import pandas as pd
 
-from utils.logs_processing import IdentityTypes
+from gin_product.utils.logs_processing import IdentityTypes
 
 
 class SubgraphExtractor:
-    def __init__(self, secrets: dict, batch_size: int = 100):
+    def __init__(self, secrets: dict, batch_size: int = 100, max_depth: int = 3):
         """Initialize connection to Neo4j database"""
         self.driver = GraphDatabase.driver(**secrets["read_neo4j"])
         self.batch_size = batch_size
+        self.max_depth = max_depth
 
     def close(self):
         """Close the database connection"""
@@ -24,9 +25,13 @@ class SubgraphExtractor:
         self,
         seeds: Dict[str, pd.DataFrame],
         terminator_labels: List[str] = None,
+        max_depth: int = None,
     ) -> Dict[str, List[Dict]]:
         if terminator_labels is None:
             terminator_labels = ["fullName", "publicIP", "completeAddress"]
+
+        if max_depth is None:
+            max_depth = self.max_depth
 
         all_nodes = {}  # Deduplicate by Neo4j ID
         all_relationships = {}
@@ -40,7 +45,7 @@ class SubgraphExtractor:
                 for i in range(0, total, self.batch_size):
                     node_values_batch = node_values[i : i + self.batch_size]
                     batch_nodes, batch_rels = self._process_batch(
-                        node_type, node_values_batch, terminator_labels
+                        node_type, node_values_batch, terminator_labels, max_depth
                     )
                     # Add request timestamp to the nodes
                     for node in batch_nodes.values():
@@ -62,16 +67,24 @@ class SubgraphExtractor:
         }
 
     def _process_batch(
-        self, node_type: str, node_values: List[str], terminator_labels: List[str]
+        self,
+        node_type: str,
+        node_values: List[str],
+        terminator_labels: List[str],
+        max_depth: int = None,
     ) -> Tuple[Dict, Dict]:
         label_filter = "|".join([f"-{label}" for label in terminator_labels])
+
+        if max_depth is None:
+            max_depth = self.max_depth
 
         cquery = (
             f"""
             UNWIND $seed_values AS node_value
             MATCH (start:`{node_type}` {{value: node_value}})
             CALL apoc.path.subgraphAll(start, {{
-                labelFilter: $labelFilter
+                labelFilter: $labelFilter,
+                maxLevel: $maxDepth
             }}) YIELD nodes as traversableNodes, relationships as traversableRels
             WITH collect(traversableNodes) as allNodeCollections,
                  collect(traversableRels) as allRelCollections
@@ -101,7 +114,10 @@ class SubgraphExtractor:
 
         with self.driver.session() as session:
             result = session.run(
-                cquery, seed_values=node_values, labelFilter=label_filter
+                cquery,
+                seed_values=node_values,
+                labelFilter=label_filter,
+                maxDepth=max_depth,
             )
             record = result.single()
             if not record:
@@ -254,8 +270,8 @@ class SubgraphWriter:
             hashed_val = hashlib.sha256(str(original_val).encode("utf-8")).hexdigest()
             node_copy["properties"]["hashed_value"] = hashed_val
 
-        if not is_seed_node:
-            del node_copy["properties"]["value"]
+        # if not is_seed_node:
+        #     del node_copy["properties"]["value"]
 
         return node_copy
 
@@ -412,9 +428,13 @@ class GraphInitializer:
     This class will be used as a one time setup script to create the graph schema and indexes.
     """
 
-    def __init__(self, secrets: dict):
+    def __init__(
+        self, secrets: dict, do_clear_graph: bool = False, batch_size: int = 10000
+    ):
         """Initialize connection to Neo4j database"""
         self.driver = GraphDatabase.driver(**secrets["write_neo4j"])
+        self.do_clear_graph = do_clear_graph
+        self.batch_size = batch_size
 
     def close(self):
         """Close the database connection"""
@@ -423,6 +443,14 @@ class GraphInitializer:
     def setup(self) -> None:
         """Create the graph schema and indexes"""
         identity_types = [identity_type.value for identity_type in IdentityTypes]
+        if self.do_clear_graph:
+            print(f"Do you want to clear the graph? (y/n)")
+            if input() == "y":
+                self.clear_graph()
+            else:
+                print("Aborting graph setup")
+                return
+
         with self.driver.session() as session:
             for identity_type in identity_types:
                 session.run(
@@ -435,3 +463,24 @@ class GraphInitializer:
                         identity_type
                     )
                 )
+
+    def clear_graph(self) -> None:
+        """
+        Clear the graph in batches to avoid overwhelming the database.
+        """
+        query = f"""
+            MATCH (n)
+            WITH n LIMIT $batch_size
+            DETACH DELETE n
+            RETURN count(n) as deleted_count
+        """
+        with self.driver.session() as session:
+            total_deleted = 0
+            while True:
+                result = session.run(query, batch_size=self.batch_size)
+                record = result.single()
+                deleted_count = record["deleted_count"] if record else 0
+                total_deleted += deleted_count
+                if deleted_count == 0:
+                    break
+            print(f"Cleared {total_deleted} nodes")

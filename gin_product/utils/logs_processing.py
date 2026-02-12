@@ -33,7 +33,7 @@ def pan_profile_processing(logs: pd.DataFrame) -> pd.DataFrame:
     """
     result = pd.DataFrame()
     result[IdentityTypes.PAN.value] = logs.merchantrequestbody.apply(
-        lambda x: json.loads(x).get("pan")
+        lambda x: json.loads(x).get("pan").lower()
     )
     result["requestTimestamp"] = logs.requesttimestamp
     result.sort_values(by="requestTimestamp", inplace=True)

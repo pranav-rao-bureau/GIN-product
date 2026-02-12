@@ -1,11 +1,14 @@
+from datetime import date, timedelta
 import os
+from tracemalloc import start
 from typing import Dict, List
 
 import pandas as pd
 from pyathena import connect
+from pyathena.pandas.cursor import PandasCursor
 import yaml
 
-from utils.logs_processing import EventTypes, pan_profile_processing
+from gin_product.utils.logs_processing import EventTypes, pan_profile_processing
 
 
 PROCESSING_FUNCTIONS = {
@@ -37,15 +40,15 @@ def athena_connect(secrets):
     Uses boto3 and a config/secrets_file to create an Athena client object.
     """
     athena_cfg = secrets["athena"]
-    athena_client = connect(**athena_cfg)
-    return athena_client
+    athena_conn = connect(**athena_cfg)
+    return athena_conn
 
 
 def retrieve_api_logs(
-    athena_client,
+    athena_conn,
     merchant_id: str,
-    end_date: str,
-    start_date: str = None,
+    end_date: date,
+    start_date: date = None,
     data_retention_days: int = None,
     event_types: List[str] = None,
 ):
@@ -57,24 +60,31 @@ def retrieve_api_logs(
         raise Exception("Please provide either start date or data retention days")
 
     if start_date is None:
-        start_date = end_date - data_retention_days
+        start_date = end_date - timedelta(days=data_retention_days)
 
     query = f"""
     SELECT merchantid,
         event, 
         merchantrequestbody,
         response,
-        requesttimestamp,
+        requesttimestamp
     FROM base.service_api_logevent_pqt
-    where merchantid = {merchant_id}
-    // make use of partition fields (year month day and hour) to filter the logs 
-    // rather than using requesttimestamp between {start_date} and {end_date}
-    and requesttimestamp between {start_date} and {end_date}
-    and merchantstatuscode = 200
-    and event in ({','.join(event_types)})
+    WHERE merchantid = '{merchant_id}'
+    AND year between {start_date.year} and {end_date.year}
+    AND month between {start_date.month} and {end_date.month}
+    AND day between {start_date.day} and {end_date.day}
     """
 
-    return athena_client.query(query).to_pandas()
+    if event_types:
+        query += (
+            f"""AND event in ({', '.join(f"'{event}'" for event in event_types)})"""
+        )
+
+    print(query)
+
+    with athena_conn:
+        cursor = athena_conn.cursor(PandasCursor)
+        return cursor.execute(query).as_pandas()
 
 
 def extract_ids_from_logs(
