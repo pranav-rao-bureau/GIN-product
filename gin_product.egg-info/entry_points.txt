@@ -1,0 +1,2 @@
+[console_scripts]
+gin-run = gin_product.main:main

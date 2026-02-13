@@ -1,0 +1,13 @@
+Metadata-Version: 2.4
+Name: gin_product
+Version: 0.1.0
+Summary: A package for GIN product graph analysis
+Requires-Dist: pyyaml
+Requires-Dist: neo4j==5.28.3
+Requires-Dist: numpy==2.0.2
+Requires-Dist: pandas==2.3.3
+Requires-Dist: python-dateutil==2.9.0.post0
+Requires-Dist: pytz==2025.2
+Requires-Dist: six==1.17.0
+Requires-Dist: tzdata==2025.3
+Requires-Dist: pytest==7.0.0

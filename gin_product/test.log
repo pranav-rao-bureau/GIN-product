@@ -1,0 +1,33 @@
+2026-02-13 14:42:13,186 INFO gin_product.main: Loading config file: conf.yml
+2026-02-13 14:42:13,187 INFO gin_product.main: Merchant ID loaded: org_x6THKX01ZFybA9Np
+2026-02-13 14:42:13,187 INFO gin_product.main: Loading secrets file: ../secrets.yml
+2026-02-13 14:42:13,188 INFO gin_product.main: Connecting to Athena and extracting API logs for merchant 'org_x6THKX01ZFybA9Np' from 2026-01-01 to 2026-01-02 with event types: ['pan-profile']
+2026-02-13 14:42:17,463 INFO gin_product.main: Extracted 5564 API logs
+2026-02-13 14:42:17,464 INFO gin_product.main: Extracting IDs from logs with event types: ['pan-profile']
+2026-02-13 14:42:17,470 INFO gin_product.main: Extracting subgraphs with terminators...
+2026-02-13 14:42:17,471 INFO gin_product.main: Processing batch of 4821 nodes for node type `pan` with label filter `-fullName|-publicIP|-completeAddress` and max depth 3
+2026-02-13 14:42:30,093 INFO gin_product.main: Subgraph extraction completed
+2026-02-13 14:42:30,094 INFO gin_product.main: Closed SubgraphExtractor connection
+2026-02-13 14:42:30,094 INFO gin_product.main: Extracted subgraphs with 16501 nodes and 21354 relationships
+2026-02-13 14:42:30,094 INFO gin_product.main: Initializing graph (clear graph: True)
+2026-02-13 14:42:30,094 INFO gin_product.main: Do you want to clear the graph? (y/n)
+2026-02-13 14:42:32,149 INFO gin_product.main: Cleared 16500 nodes
+2026-02-13 14:42:32,395 INFO gin_product.main: GraphInitializer setup completed
+2026-02-13 14:42:32,396 INFO gin_product.main: Closed GraphInitializer connection
+2026-02-13 14:42:32,396 INFO gin_product.main: Writing subgraphs to graph DB with 16501 nodes and 21354 relationships
+2026-02-13 14:42:32,509 INFO gin_product.main: Writing nodes with labels pan and batch size 5609
+2026-02-13 14:42:32,787 INFO gin_product.main: Writing nodes with labels mobile and batch size 1582
+2026-02-13 14:42:32,858 INFO gin_product.main: Writing nodes with labels email and batch size 211
+2026-02-13 14:42:32,899 INFO gin_product.main: Writing nodes with labels dlNumber and batch size 1539
+2026-02-13 14:42:32,946 INFO gin_product.main: Writing nodes with labels fullName and batch size 6000
+2026-02-13 14:42:33,077 INFO gin_product.main: Writing nodes with labels fullName and batch size 1519
+2026-02-13 14:42:33,131 INFO gin_product.main: Writing nodes with labels completeAddress and batch size 34
+2026-02-13 14:42:33,156 INFO gin_product.main: Writing nodes with labels publicIP and batch size 7
+2026-02-13 14:42:33,177 INFO gin_product.main: Writing relationships with type relatedTo and batch size 6000
+2026-02-13 14:43:10,731 INFO gin_product.main: Writing relationships with type relatedTo and batch size 6000
+2026-02-13 14:43:47,879 INFO gin_product.main: Writing relationships with type relatedTo and batch size 6000
+2026-02-13 14:44:24,281 INFO gin_product.main: Writing relationships with type relatedTo and batch size 3347
+2026-02-13 14:44:44,580 INFO gin_product.main: Writing relationships with type deListed and batch size 6
+2026-02-13 14:44:44,683 INFO gin_product.main: Writing relationships with type prevRelatedTo and batch size 1
+2026-02-13 14:44:44,745 INFO gin_product.main: Subgraphs with 16501 nodes and 21354 relationships written to graph DB successfully
+2026-02-13 14:44:44,745 INFO gin_product.main: Closed SubgraphWriter connection

@@ -55,16 +55,16 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--end-date",
         required=False,
-        default=date.today().isoformat(),
-        type=str,
+        default=date.today(),
+        type=lambda d: date.fromisoformat(d) if isinstance(d, str) else d,
         help="End date for API logs extraction in 'YYYY-MM-DD' format",
     )
     parser.add_argument(
         "--start-date",
         required=False,
-        default=(date.today() - timedelta(days=1)).isoformat(),
-        type=str,
-        help="Start date for API logs extraction in 'YYYY-MM-DD' format",
+        default=(date.today() - timedelta(days=1)),
+        type=lambda d: date.fromisoformat(d) if isinstance(d, str) else d,
+        help="Start date for API logs extraction in 'YYYY-MM-DD' format (as datetime.date object)",
     )
     parser.add_argument(
         "--batch-size",
@@ -75,27 +75,46 @@ def create_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--clear-graph",
-        required=False,
-        default=False,
-        type=bool,
+        action="store_true",
         help="Whether to clear the graph before setup",
     )
     return parser
 
 
+import logging
+
+
 def main():
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    logger = logging.getLogger("gin_product.main")
+
     parser = create_parser()
     args = parser.parse_args()
 
+    logger.info("Loading config file: %s", args.config)
     config = load_config(args.config)
     merchant_config = config.get("merchant_config", {})
     merchant_id = merchant_config.get("merchantid")
+    logger.info("Merchant ID loaded: %s", merchant_id)
 
+    logger.info("Loading secrets file: %s", args.secrets)
     secrets = load_secrets(args.secrets)
 
     # Extract IDs from API logs using merchant config
     end_date = args.end_date
     start_date = args.start_date
+    logger.info(
+        "Connecting to Athena and extracting API logs for merchant '%s' from %s to %s with event types: %s",
+        merchant_id,
+        start_date,
+        end_date,
+        args.event_types,
+    )
+
     athena_client = athena_connect(secrets)
     logs = retrieve_api_logs(
         athena_client,
@@ -104,19 +123,53 @@ def main():
         start_date=start_date,
         event_types=args.event_types,
     )
+    logger.info("Extracted %d API logs", len(logs))
+
+    logger.info("Extracting IDs from logs with event types: %s", args.event_types)
     seeds: Dict[str, pd.DataFrame] = extract_ids_from_logs(logs, args.event_types)
 
-    extractor = SubgraphExtractor(secrets, batch_size=args.batch_size)
-    subgraph = extractor.extract_subgraph_with_terminators(seeds=seeds)
-    extractor.close()
+    logger.info("Extracting subgraphs with terminators...")
+    extractor = SubgraphExtractor(secrets, batch_size=args.batch_size, logger=logger)
+    try:
+        subgraph = extractor.extract_subgraph_with_terminators(seeds=seeds)
+        logger.info("Subgraph extraction completed")
+    finally:
+        extractor.close()
+        logger.info("Closed SubgraphExtractor connection")
+    logger.info(
+        "Extracted subgraphs with %d nodes and %d relationships",
+        len(subgraph["nodes"]),
+        len(subgraph["relationships"]),
+    )
 
-    initializer = GraphInitializer(secrets, do_clear_graph=args.clear_graph)
-    initializer.setup()
-    initializer.close()
+    logger.info("Initializing graph (clear graph: %s)", args.clear_graph)
+    initializer = GraphInitializer(
+        secrets, logger=logger, do_clear_graph=args.clear_graph
+    )
+    try:
+        initializer.setup()
+        logger.info("GraphInitializer setup completed")
+    finally:
+        initializer.close()
+        logger.info("Closed GraphInitializer connection")
 
-    writer = SubgraphWriter(secrets)
-    writer.write_subgraphs(subgraph, seed_identities=seeds)
-    writer.close()
+    logger.info(
+        "Writing subgraphs to graph DB with %d nodes and %d relationships",
+        len(subgraph["nodes"]),
+        len(subgraph["relationships"]),
+    )
+
+    writer = SubgraphWriter(secrets, logger=logger, batch_size=args.batch_size)
+    try:
+        writer.write_subgraphs(subgraph, seed_identities=seeds)
+        logger.info(
+            "Subgraphs with %d nodes and %d relationships written to graph DB successfully",
+            len(subgraph["nodes"]),
+            len(subgraph["relationships"]),
+        )
+    finally:
+        writer.close()
+        logger.info("Closed SubgraphWriter connection")
 
 
 if __name__ == "__main__":

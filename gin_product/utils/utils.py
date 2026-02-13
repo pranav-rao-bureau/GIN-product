@@ -78,8 +78,6 @@ def retrieve_api_logs(
             f"""AND event in ({', '.join(f"'{event}'" for event in event_types)})"""
         )
 
-    print(query)
-
     with athena_conn:
         cursor = athena_conn.cursor(PandasCursor)
         return cursor.execute(query).as_pandas()
