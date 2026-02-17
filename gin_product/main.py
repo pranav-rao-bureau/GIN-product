@@ -78,6 +78,7 @@ def create_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Whether to clear the graph before setup",
     )
+
     return parser
 
 
@@ -144,7 +145,9 @@ def main():
 
     logger.info("Initializing graph (clear graph: %s)", args.clear_graph)
     initializer = GraphInitializer(
-        secrets, logger=logger, do_clear_graph=args.clear_graph
+        secrets,
+        logger=logger,
+        do_clear_graph=args.clear_graph,
     )
     try:
         initializer.setup()

@@ -8,41 +8,18 @@ Scope:
 - nodes ingested in the last 24 hours
 
 Designed for daily cron execution; features are written to CSV.
+
+Heavy work is done in Neo4j (Cypher + GDS WCC). Python is used only for
+driver setup, running queries, collecting results, building DataFrames, and writing CSV.
 """
 
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 from neo4j import GraphDatabase
-
-
-def _union_find_components(edges: List[Tuple[int, int]]) -> Dict[int, int]:
-    """Compute connected components via Union-Find. Returns node_id -> component_id."""
-    parent: Dict[int, int] = {}
-
-    def find(x: int) -> int:
-        if x not in parent:
-            parent[x] = x
-        if parent[x] != x:
-            parent[x] = find(parent[x])
-        return parent[x]
-
-    def union(x: int, y: int) -> None:
-        px, py = find(x), find(y)
-        if px != py:
-            parent[px] = py
-
-    for a, b in edges:
-        union(a, b)
-
-    # Normalize so each component has a canonical id (min node id in component)
-    comp_id = {}
-    for node in parent:
-        comp_id[node] = find(node)
-    return comp_id
 
 
 class GraphFeatures:
@@ -57,7 +34,7 @@ class GraphFeatures:
         return datetime.now(timezone.utc) - timedelta(hours=self.hours_window)
 
     def _get_nodes_with_degree(self) -> pd.DataFrame:
-        """Return nodes ingested in the last hours_window with degree centrality."""
+        """Return nodes ingested in the last hours_window with degree centrality (Neo4j)."""
         cutoff = self._cutoff()
         query = """
             MATCH (n)
@@ -68,6 +45,7 @@ class GraphFeatures:
             RETURN id(n) AS node_id,
                    labels(n) AS labels,
                    n.hashed_value AS hashed_value,
+                   n.value AS value,
                    n.requestTimestamp AS request_timestamp,
                    degree
         """
@@ -80,14 +58,113 @@ class GraphFeatures:
                     "node_id",
                     "labels",
                     "hashed_value",
+                    "value",
                     "request_timestamp",
                     "degree",
                 ]
             )
         return pd.DataFrame(rows)
 
+    def _get_wcc_and_label_components(self):
+        """
+        Run GDS Weakly Connected Components on the recent subgraph, then for each node
+        return (nodeId, componentId, label) so Python can merge component_id and
+        compute component counts by type. All graph processing in Neo4j.
+        Returns list of dicts with keys: nodeId, componentId, label (label may be null).
+        """
+        cutoff = self._cutoff()
+        # GDS Cypher projection may not see outer $cutoff; pass as literal for the inner queries
+        cutoff_str = cutoff.isoformat()
+        node_query = "MATCH (n) WHERE n.requestTimestamp IS NOT NULL AND n.requestTimestamp >= datetime($cutoff) RETURN id(n) AS id"
+        rel_query = (
+            "MATCH (a)-[r]-(b) "
+            "WHERE (a.requestTimestamp IS NOT NULL AND a.requestTimestamp >= datetime($cutoff)) "
+            "   OR (b.requestTimestamp IS NOT NULL AND b.requestTimestamp >= datetime($cutoff)) "
+            "RETURN id(a) AS source, id(b) AS target"
+        )
+        # Single Neo4j query: WCC stream then join to node labels, one row per (node, label)
+        query = """
+            CALL gds.wcc.stream({
+                nodeQuery: $nodeQuery,
+                relationshipQuery: $relQuery,
+                parameters: { cutoff: $cutoff }
+            })
+            YIELD nodeId, componentId
+            MATCH (n) WHERE id(n) = nodeId
+            WITH nodeId, componentId, labels(n) AS labels
+            UNWIND CASE WHEN labels IS NOT NULL AND size(labels) > 0 THEN labels ELSE [null] END AS label
+            RETURN nodeId, componentId, label
+        """
+        params = {
+            "cutoff": cutoff_str,
+            "nodeQuery": node_query,
+            "relQuery": rel_query,
+        }
+        with self.driver.session() as session:
+            result = session.run(query, params)
+            return [dict(record) for record in result]
+
+    def _get_aggregated_stats_from_neo4j(self) -> dict:
+        """
+        One Neo4j transaction: degree stats (nodes, mean, std, min, max, median) and
+        edge count for the recent window. Returns a single dict of aggregates.
+        """
+        cutoff = self._cutoff()
+        degree_query = """
+            MATCH (n)
+            WHERE n.requestTimestamp IS NOT NULL AND n.requestTimestamp >= $cutoff
+            OPTIONAL MATCH (n)-[r]-()
+            WITH n, count(r) AS degree
+            RETURN count(n) AS nodes_in_window,
+                   avg(degree) AS degree_mean,
+                   stDev(degree) AS degree_std,
+                   min(degree) AS degree_min,
+                   max(degree) AS degree_max,
+                   percentileCont(degree, 0.5) AS degree_median
+        """
+        edge_query = """
+            MATCH (a)-[r]-(b)
+            WHERE (a.requestTimestamp IS NOT NULL AND a.requestTimestamp >= $cutoff)
+               OR (b.requestTimestamp IS NOT NULL AND b.requestTimestamp >= $cutoff)
+            RETURN count(r) / 2 AS edges_in_window
+        """
+        with self.driver.session() as session:
+            deg_result = session.run(degree_query, cutoff=cutoff)
+            deg_record = deg_result.single() or {}
+            edge_result = session.run(edge_query, cutoff=cutoff)
+            edge_record = edge_result.single() or {}
+        return {
+            "nodes_in_window": deg_record.get("nodes_in_window") or 0,
+            "degree_mean": float(deg_record.get("degree_mean") or 0.0),
+            "degree_std": float(deg_record.get("degree_std") or 0.0),
+            "degree_min": int(deg_record.get("degree_min") or 0),
+            "degree_max": int(deg_record.get("degree_max") or 0),
+            "degree_median": float(deg_record.get("degree_median") or 0.0),
+            "edges_in_window": int(edge_record.get("edges_in_window") or 0),
+        }
+
+    def _wcc_fallback_python(self, edges: List[Tuple[int, int]]) -> Dict[int, int]:
+        """Union-Find in Python when GDS is not available. Returns node_id -> component_id."""
+        parent: Dict[int, int] = {}
+
+        def find(x: int) -> int:
+            if x not in parent:
+                parent[x] = x
+            if parent[x] != x:
+                parent[x] = find(parent[x])
+            return parent[x]
+
+        def union(x: int, y: int) -> None:
+            px, py = find(x), find(y)
+            if px != py:
+                parent[px] = py
+
+        for a, b in edges:
+            union(a, b)
+        return {node: find(node) for node in parent}
+
     def _get_edges_for_recent_nodes(self) -> List[Tuple[int, int]]:
-        """Return edges where at least one endpoint was ingested in the window (for WCC)."""
+        """Return edges where at least one endpoint was ingested in the window (Neo4j)."""
         cutoff = self._cutoff()
         query = """
             MATCH (a)-[r]-(b)
@@ -99,98 +176,98 @@ class GraphFeatures:
             result = session.run(query, cutoff=cutoff)
             return [(record["a_id"], record["b_id"]) for record in result]
 
-    def _connected_component_counts_by_type(
-        self, node_df: pd.DataFrame, edges: List[Tuple[int, int]]
-    ) -> Dict[str, int]:
-        """
-        For each node type (label), count how many connected components contain
-        at least one node of that type (among nodes in the time window).
-        """
-        if node_df.empty:
-            return {}
-        node_ids = set(node_df["node_id"].astype(int))
-        comp = _union_find_components(edges)
-        # component_id -> set of labels present in that component (from window nodes only)
-        comp_labels: Dict[int, Set[str]] = defaultdict(set)
-        for _, row in node_df.iterrows():
-            nid = int(row["node_id"])
-            if nid not in comp:
-                comp[nid] = nid
-            cid = comp[nid]
-            for label in row["labels"] or []:
-                comp_labels[cid].add(label)
-        # For each label, count components that contain at least one node with that label
-        label_component_count: Dict[str, int] = defaultdict(int)
-        for labels in comp_labels.values():
-            for label in labels:
-                label_component_count[label] += 1
-        return dict(label_component_count)
-
     def extract_features(
         self,
-    ) -> Tuple[pd.DataFrame, List[Tuple[int, int]]]:
+    ) -> Tuple[pd.DataFrame, Optional[List[dict]]]:
         """
         Extract node-level features for nodes ingested in the last 24 hours:
         node_id, labels, hashed_value, request_timestamp, degree, component_id.
-        Returns (node_df, edges) so callers can reuse edges for aggregation.
+        Uses Neo4j for degree and GDS WCC for components; falls back to Python
+        union-find if GDS is unavailable.
+        Returns (node_df, wcc_rows). wcc_rows is None if no nodes.
         """
         node_df = self._get_nodes_with_degree()
-        edges = self._get_edges_for_recent_nodes() if not node_df.empty else []
         if node_df.empty:
             node_df["component_id"] = pd.Series(dtype="Int64")
-            return node_df, edges
+            return node_df, None
 
-        comp = _union_find_components(edges)
+        wcc_rows = None
+        try:
+            wcc_rows = self._get_wcc_and_label_components()
+        except Exception:
+            edges = self._get_edges_for_recent_nodes()
+            comp = self._wcc_fallback_python(edges)
+            node_df["component_id"] = node_df["node_id"].map(
+                lambda nid: comp.get(int(nid), int(nid))
+            )
+            return node_df, None
+
+        comp_map = {r["nodeId"]: r["componentId"] for r in wcc_rows}
         node_df["component_id"] = node_df["node_id"].map(
-            lambda nid: comp.get(int(nid), int(nid))
+            lambda nid: comp_map.get(int(nid), int(nid))
         )
-        return node_df, edges
+        return node_df, wcc_rows
 
     def compute_merchant_aggregated_features(
-        self, df: pd.DataFrame, edges: Optional[List[Tuple[int, int]]] = None
+        self, df: pd.DataFrame, wcc_rows: Optional[List[dict]] = None
     ) -> pd.DataFrame:
         """
-        Aggregate node-level features into one row per run (merchant-level summary).
-        Includes degree stats, component counts by node type, and network stats.
-
-        Args:
-            df: Node-level features from extract_features().
-            edges: Optional pre-fetched edge list; if None, will be queried.
+        Aggregate into one row per run (merchant-level summary). Degree and edge
+        stats come from Neo4j; unique_components and components_by_label from
+        Neo4j (GDS + Cypher) or from wcc_rows when provided.
         """
         if df.empty:
             return self._empty_aggregated_row()
 
-        if edges is None:
-            edges = self._get_edges_for_recent_nodes()
-        component_counts_by_type = self._connected_component_counts_by_type(df, edges)
-
-        # Degree stats
-        degree = df["degree"]
+        now = datetime.now(timezone.utc)
         agg = {
-            "feature_date": datetime.now(timezone.utc).date().isoformat(),
-            "feature_run_utc": datetime.now(timezone.utc).isoformat(),
-            "nodes_in_window": len(df),
-            "edges_in_window": len(edges),
-            "degree_mean": float(degree.mean()),
-            "degree_std": float(degree.std()) if len(degree) > 1 else 0.0,
-            "degree_min": int(degree.min()),
-            "degree_max": int(degree.max()),
-            "degree_median": float(degree.median()),
-            "unique_components": (
-                int(df["component_id"].nunique()) if "component_id" in df.columns else 0
-            ),
+            "feature_date": now.date().isoformat(),
+            "feature_run_utc": now.isoformat(),
         }
-        for label, count in component_counts_by_type.items():
-            agg[f"components_with_{label}"] = count
 
+        stats = self._get_aggregated_stats_from_neo4j()
+        agg["nodes_in_window"] = stats["nodes_in_window"]
+        agg["edges_in_window"] = stats["edges_in_window"]
+        agg["degree_mean"] = stats["degree_mean"]
+        agg["degree_std"] = stats["degree_std"]
+        agg["degree_min"] = stats["degree_min"]
+        agg["degree_max"] = stats["degree_max"]
+        agg["degree_median"] = stats["degree_median"]
+
+        if wcc_rows is not None:
+            unique_comps = len({r["componentId"] for r in wcc_rows})
+            # One row per (node, label); count distinct componentId per label
+            seen: Dict[str, set] = defaultdict(set)
+            for r in wcc_rows:
+                if r.get("label") is not None:
+                    seen[r["label"]].add(r["componentId"])
+            for label, comp_ids in seen.items():
+                agg[f"components_with_{label}"] = len(comp_ids)
+        else:
+            unique_comps = (
+                int(df["component_id"].nunique()) if "component_id" in df.columns else 0
+            )
+            # Fallback: compute component counts by type from node-level df
+            seen = defaultdict(set)
+            for _, row in df.iterrows():
+                cid = row.get("component_id")
+                if pd.isna(cid):
+                    continue
+                for label in row.get("labels") or []:
+                    seen[label].add(cid)
+            for label, comp_ids in seen.items():
+                agg[f"components_with_{label}"] = len(comp_ids)
+
+        agg["unique_components"] = unique_comps
         return pd.DataFrame([agg])
 
     def _empty_aggregated_row(self) -> pd.DataFrame:
+        now = datetime.now(timezone.utc)
         return pd.DataFrame(
             [
                 {
-                    "feature_date": datetime.now(timezone.utc).date().isoformat(),
-                    "feature_run_utc": datetime.now(timezone.utc).isoformat(),
+                    "feature_date": now.date().isoformat(),
+                    "feature_run_utc": now.isoformat(),
                     "nodes_in_window": 0,
                     "edges_in_window": 0,
                     "degree_mean": 0.0,
@@ -212,17 +289,11 @@ class GraphFeatures:
         """
         Extract features, compute merchant-level aggregates, and write to CSV.
         Suitable for daily cron: append one row to the aggregated CSV per run.
-
-        Args:
-            output_path: Path for aggregated (merchant-level) features CSV.
-            include_node_level: If True, also write node-level features to CSV.
-            node_level_path: Path for node-level CSV. Used only if include_node_level is True.
         """
-        node_df, edges = self.extract_features()
-        agg_df = self.compute_merchant_aggregated_features(node_df, edges=edges)
+        node_df, wcc_rows = self.extract_features()
+        agg_df = self.compute_merchant_aggregated_features(node_df, wcc_rows=wcc_rows)
 
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-        # Append aggregated row; write header only when creating a new file
         file_exists = (
             Path(output_path).exists() and Path(output_path).stat().st_size > 0
         )

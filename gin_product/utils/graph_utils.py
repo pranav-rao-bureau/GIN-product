@@ -4,11 +4,14 @@ import hashlib
 import json
 import logging
 from typing import Dict, List, Set, Tuple
+import warnings
 
 from neo4j import GraphDatabase
 import pandas as pd
 
-from gin_product.utils.logs_processing import IdentityTypes
+from utils.logs_processing import IdentityTypes
+
+warnings.filterwarnings("ignore")
 
 
 class SubgraphExtractor:
@@ -17,7 +20,7 @@ class SubgraphExtractor:
         secrets: dict,
         logger: logging.Logger,
         batch_size: int = 100,
-        max_depth: int = 3,
+        max_depth: int = 2,
     ):
         """Initialize connection to Neo4j database"""
         self.driver = GraphDatabase.driver(**secrets["read_neo4j"])
@@ -32,11 +35,8 @@ class SubgraphExtractor:
     def extract_subgraph_with_terminators(
         self,
         seeds: Dict[str, pd.DataFrame],
-        terminator_labels: List[str] = None,
         max_depth: int = None,
     ) -> Dict[str, List[Dict]]:
-        if terminator_labels is None:
-            terminator_labels = ["fullName", "publicIP", "completeAddress"]
 
         if max_depth is None:
             max_depth = self.max_depth
@@ -53,7 +53,7 @@ class SubgraphExtractor:
                 for i in range(0, total, self.batch_size):
                     node_values_batch = node_values[i : i + self.batch_size]
                     batch_nodes, batch_rels = self._process_batch(
-                        node_type, node_values_batch, terminator_labels, max_depth
+                        node_type, node_values_batch, max_depth
                     )
                     # Add request timestamp to the nodes
                     for node in batch_nodes.values():
@@ -78,54 +78,42 @@ class SubgraphExtractor:
         self,
         node_type: str,
         node_values: List[str],
-        terminator_labels: List[str],
         max_depth: int = None,
     ) -> Tuple[Dict, Dict]:
-        label_filter = "|".join([f"-{label}" for label in terminator_labels])
+
         self.logger.info(
-            "Processing batch of %d nodes for node type `%s` with label filter `%s` and max depth %d",
+            "Processing batch of %d nodes for node type `%s` with max depth %d",
             len(node_values),
             node_type,
-            label_filter,
             max_depth,
         )
 
         if max_depth is None:
             max_depth = self.max_depth
 
-        cquery = (
-            f"""
+        cquery = f"""
             UNWIND $seed_values AS node_value
-            MATCH (start:`{node_type}` {{value: node_value}})
+            MATCH (start:{node_type} {{value: node_value}})
+
             CALL apoc.path.subgraphAll(start, {{
-                labelFilter: $labelFilter,
-                maxLevel: $maxDepth
-            }}) YIELD nodes as traversableNodes, relationships as traversableRels
-            WITH collect(traversableNodes) as allNodeCollections,
-                 collect(traversableRels) as allRelCollections
+                labelFilter: "-publicIP|-fullName|-completeAddress",
+                maxLevel: {max_depth}
+            }}) YIELD nodes, relationships
 
-            WITH apoc.coll.toSet(apoc.coll.flatten(allNodeCollections)) as uniqueNodes,
-                 apoc.coll.toSet(apoc.coll.flatten(allRelCollections)) as uniqueRels
-
-            UNWIND uniqueNodes as n
+            UNWIND nodes AS n
             OPTIONAL MATCH (n)-[r]-(terminator)
-            WHERE """
-            + " OR ".join([f"terminator:{label}" for label in terminator_labels])
-            + """
+            WHERE terminator:fullName OR terminator:publicIP OR terminator:completeAddress
 
-            WITH uniqueNodes, uniqueRels, terminator, r
-            WHERE terminator IS NOT NULL 
+            WITH 
+                collect(DISTINCT n) AS coreNodes,
+                collect(DISTINCT terminator) AS termNodes,
+                collect(DISTINCT r) AS termRels,
+                relationships AS coreRels
 
-            WITH uniqueNodes, uniqueRels,
-                apoc.coll.toSet(collect(terminator)) as terminatorNodes,
-                apoc.coll.toSet(collect(r)) as terminatorRels
-
-            WITH uniqueNodes + terminatorNodes as finalNodes,
-                 uniqueRels + terminatorRels as finalRels
-
-            RETURN finalNodes as nodes, finalRels as relationships
-            """
-        )
+            RETURN 
+                [x IN (coreNodes + termNodes) WHERE x IS NOT NULL] AS nodes,
+                [x IN (coreRels + termRels) WHERE x IS NOT NULL] AS relationships
+        """
 
         batch_nodes = {}
         batch_relationships = {}
@@ -134,26 +122,34 @@ class SubgraphExtractor:
             result = session.run(
                 cquery,
                 seed_values=node_values,
-                labelFilter=label_filter,
-                maxDepth=max_depth,
+                max_depth=max_depth,
             )
             record = result.single()
             if not record:
                 return batch_nodes, batch_relationships
 
             for node in record["nodes"]:
-                batch_nodes[node.id] = {
-                    "id": node.id,
-                    "labels": list(node.labels),
-                    "properties": dict(node),
+                batch_nodes[node.element_id] = {
+                    "id": node.element_id,
+                    "label": sorted(node.labels)[0],
+                    "properties": {
+                        "value": node["value"],
+                        "firstSeen": node["firstSeen"],
+                        "lastSeen": node["lastSeen"],
+                        "fraudCount": node.get("fraudCount", 0),
+                    },
                 }
             for rel in record["relationships"]:
-                batch_relationships[rel.id] = {
-                    "id": rel.id,
+                batch_relationships[rel.element_id] = {
+                    "id": rel.element_id,
                     "type": rel.type,
-                    "start_node_id": rel.start_node.id,
-                    "end_node_id": rel.end_node.id,
-                    "properties": dict(rel),
+                    "start_node_id": rel.start_node.element_id,
+                    "end_node_id": rel.end_node.element_id,
+                    "properties": {
+                        "count": rel["relCount"],
+                        "lastSeen": rel["lastSeen"],
+                        "firstSeen": rel["firstSeen"],
+                    },
                 }
 
         return batch_nodes, batch_relationships
@@ -290,9 +286,9 @@ class SubgraphWriter:
             hashed_val = hashlib.sha256(str(original_val).encode("utf-8")).hexdigest()
             node_copy["properties"]["hashed_value"] = hashed_val
 
-        if not is_seed_node:
-            del node_copy["properties"]["value"]
-
+        if is_seed_node or node_copy["label"] == IdentityTypes.NAME.value:
+            return node_copy
+        node_copy["properties"].pop("value", None)
         return node_copy
 
     @staticmethod
@@ -324,11 +320,11 @@ class SubgraphWriter:
 
             node_key = masked_node["id"]
             node_id_map[node_key] = {
-                "labels": masked_node["labels"],
+                "label": masked_node["label"],
                 "hashed_value": props.get("hashed_value"),
             }
 
-            label_key = ":".join(sorted(masked_node["labels"]))
+            label_key = masked_node["label"]
             nodes_by_label[label_key].append(props)
 
         rels_by_type = defaultdict(list)
@@ -342,9 +338,9 @@ class SubgraphWriter:
 
                 rels_by_type[rel["type"]].append(
                     {
-                        "start_labels": start["labels"],
+                        "start_label": start["label"],
                         "start_value": start["hashed_value"],
-                        "end_labels": end["labels"],
+                        "end_label": end["label"],
                         "end_value": end["hashed_value"],
                         "props": rel_props,
                     }
@@ -359,7 +355,7 @@ class SubgraphWriter:
                     )
                     node_cypher = f"""
                     UNWIND $batch AS row
-                    MERGE (n:{labels} {{ hashed_value: row.hashed_value}})
+                    MERGE (n:{labels}:Identity {{ hashed_value: row.hashed_value}})
                     SET n += row
                     """
                     session.run(node_cypher, batch=batch)
@@ -371,11 +367,18 @@ class SubgraphWriter:
                         f"Writing relationships with type {rel_type} and batch size {len(batch)}"
                     )
                     rel_cypher = f"""
-                    UNWIND $batch AS row
-                    MATCH (a {{hashed_value: row.start_value}})
-                    MATCH (b {{hashed_value: row.end_value}})
-                    MERGE (a)-[r:{rel_type}]->(b)
-                    SET r += row.props
+                        UNWIND $batch AS row
+                        CALL apoc.cypher.run(
+                            "MATCH (n:" + row.start_label + " {{hashed_value: $val}}) RETURN n", 
+                            {{val: row.start_value}}
+                        ) YIELD value AS resA
+                        CALL apoc.cypher.run(
+                            "MATCH (m:" + row.end_label + " {{hashed_value: $val}}) RETURN m", 
+                            {{val: row.end_value}}
+                        ) YIELD value AS resB
+                        WITH resA.n AS a, resB.m AS b, row
+                        MERGE (a)-[r:{rel_type}]->(b)
+                        SET r += row.props
                     """
                     session.run(rel_cypher, batch=batch)
 
@@ -447,7 +450,6 @@ class GraphInitializer:
 
     def setup(self) -> None:
         """Create the graph schema and indexes"""
-        identity_types = [identity_type.value for identity_type in IdentityTypes]
         if self.do_clear_graph:
             self.logger.info(f"Do you want to clear the graph? (y/n)")
             if input() == "y":
@@ -457,9 +459,9 @@ class GraphInitializer:
                 return
 
         with self.driver.session() as session:
-            for identity_type in identity_types:
+            for identity_type in IdentityTypes:
                 session.run(
-                    f"CREATE INDEX {identity_type}_hashed_index IF NOT EXISTS FOR (n:{identity_type}) ON (n.hashed_value)"
+                    f"CREATE INDEX {identity_type.value}_hashed_index IF NOT EXISTS FOR (n:{identity_type.value}) ON (n.hashed_value)"
                 )
 
     def clear_graph(self) -> None:
