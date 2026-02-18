@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 from typing import Dict, List, Set, Tuple
+import uuid
 import warnings
 
 from neo4j import GraphDatabase
@@ -303,13 +304,56 @@ class SubgraphWriter:
                 seeds.update(set(seed_df[identity_type].values.tolist()))
         return seeds
 
+    @staticmethod
+    def _connected_component_ids(
+        nodes: List[dict], relationships: List[dict]
+    ) -> Dict[str, str]:
+        """
+        Compute a component_id (ring id) for each node so that all nodes in the same
+        connected component get the same id. Uses Union-Find on the in-memory graph.
+
+        Returns:
+            Map from node id (element_id) to component_id (UUID string).
+        """
+        parent: Dict[str, str] = {}
+
+        def find(x: str) -> str:
+            if x not in parent:
+                parent[x] = x
+            if parent[x] != x:
+                parent[x] = find(parent[x])
+            return parent[x]
+
+        def union(x: str, y: str) -> None:
+            px, py = find(x), find(y)
+            if px != py:
+                parent[px] = py
+
+        for node in nodes:
+            find(node["id"])
+        for rel in relationships:
+            start_id = rel.get("start_node_id")
+            end_id = rel.get("end_node_id")
+            if start_id and end_id:
+                union(start_id, end_id)
+
+        roots = {find(n["id"]) for n in nodes}
+        root_to_uuid: Dict[str, str] = {r: str(uuid.uuid4()) for r in roots}
+        return {n["id"]: root_to_uuid[find(n["id"])] for n in nodes}
+
     def write_subgraphs(
         self, subgraph: Dict[str, List], seed_identities: Dict[str, pd.DataFrame]
     ) -> None:
+        """
+        Write subgraph nodes and relationships to Neo4j. Each node gets a component_id
+        (ring id) so that all nodes in the same connected component share the same id.
+        New components get a new id; components that merge with existing nodes are
+        unified in a post-write step.
+        """
         seeds = self.get_seeds(seed_identities)
 
         node_id_map = {}
-        nodes_by_label = defaultdict(list)
+        node_rows: List[Tuple[str, str, dict]] = []  # (node_key, label, props)
 
         for node in subgraph["nodes"]:
             is_seed_node = node["properties"]["value"] in seeds
@@ -323,8 +367,15 @@ class SubgraphWriter:
                 "label": masked_node["label"],
                 "hashed_value": props.get("hashed_value"),
             }
+            node_rows.append((node_key, masked_node["label"], props))
 
-            label_key = masked_node["label"]
+        # Assign component_id so all nodes in the same in-memory component share one id
+        component_ids = self._connected_component_ids(
+            subgraph["nodes"], subgraph["relationships"]
+        )
+        nodes_by_label: Dict[str, List[dict]] = defaultdict(list)
+        for node_key, label_key, props in node_rows:
+            props["component_id"] = component_ids[node_key]
             nodes_by_label[label_key].append(props)
 
         rels_by_type = defaultdict(list)
@@ -353,10 +404,13 @@ class SubgraphWriter:
                     self.logger.info(
                         f"Writing nodes with labels {labels} and batch size {len(batch)}"
                     )
+                    # On CREATE set full row; ON MATCH keep existing component_id
                     node_cypher = f"""
                     UNWIND $batch AS row
                     MERGE (n:{labels}:Identity {{ hashed_value: row.hashed_value}})
-                    SET n += row
+                    ON CREATE SET n += row
+                    ON MATCH SET n += apoc.map.removeKey(row, 'component_id'),
+                                   n.component_id = coalesce(n.component_id, row.component_id)
                     """
                     session.run(node_cypher, batch=batch)
 
@@ -381,6 +435,34 @@ class SubgraphWriter:
                         SET r += row.props
                     """
                     session.run(rel_cypher, batch=batch)
+
+            # Unify component_id so components that merged with existing nodes get one id.
+            # Iterate: set each node's component_id to min of neighbors' until fixpoint.
+            self._merge_component_ids(session)
+
+    def _merge_component_ids(self, session) -> None:
+        """
+        Unify component_id across connected nodes. When new nodes were MERGED with
+        existing nodes, the component may have mixed ids. Repeatedly set each node's
+        component_id to the minimum of its neighbors' until no changes.
+        """
+        merge_cypher = """
+            MATCH (n)-[]-(m)
+            WHERE n.component_id IS NOT NULL AND m.component_id IS NOT NULL
+              AND n.component_id > m.component_id
+            WITH n, min(m.component_id) AS newId
+            SET n.component_id = newId
+            RETURN count(n) AS updated
+        """
+        updated = 1  # Ensure the loop runs at least once
+        while updated > 0:
+            result = session.run(merge_cypher)
+            record = result.single()
+            updated = record["updated"] if record else 0
+            if updated > 0:
+                self.logger.debug("Unified component_id for %d nodes", updated)
+            else:
+                break
 
 
 class SubgraphCleaner:
@@ -463,6 +545,9 @@ class GraphInitializer:
                 session.run(
                     f"CREATE INDEX {identity_type.value}_hashed_index IF NOT EXISTS FOR (n:{identity_type.value}) ON (n.hashed_value)"
                 )
+            session.run(
+                "CREATE INDEX IF NOT EXISTS FOR (n:Identity) ON (n.component_id)"
+            )
 
     def clear_graph(self) -> None:
         """
